@@ -1,0 +1,186 @@
+import time
+import requests
+from datetime import datetime
+from typing import List
+
+UA = "Your Name your.email@domain.com"   # put something real here
+SLEEP = 0.2
+
+SEC_HEADERS = {"User-Agent": UA, "Accept-Encoding": "gzip, deflate"}
+
+def _get_json(url: str) -> dict:
+    r = requests.get(url, headers=SEC_HEADERS, timeout=30)
+    r.raise_for_status()
+    time.sleep(SLEEP)
+    return r.json()
+
+def _ticker_to_cik10(ticker: str) -> str:
+    data = _get_json("https://www.sec.gov/files/company_tickers.json")
+    t = ticker.strip().upper()
+    for _, row in data.items():
+        if row.get("ticker", "").upper() == t:
+            return f"{int(row['cik_str']):010d}"
+    raise ValueError(f"Ticker not found: {ticker}")
+
+def _primary_doc_url(cik10: str, accession: str, primary_doc: str) -> str:
+    cik_dir = str(int(cik10))  # non-padded in EDGAR path
+    acc_nodash = accession.replace("-", "")
+    return f"https://www.sec.gov/Archives/edgar/data/{cik_dir}/{acc_nodash}/{primary_doc}"
+
+def list_424b5_primary_urls(ticker: str, start_date: str, end_date: str) -> List[str]:
+    """
+    Returns primary document URLs for filings where form == '424B5' within [start_date, end_date].
+    Dates must be 'YYYY-MM-DD'.
+    """
+    start = datetime.strptime(start_date, "%Y-%m-%d").date()
+    end = datetime.strptime(end_date, "%Y-%m-%d").date()
+    if end < start:
+        raise ValueError("end_date must be >= start_date")
+
+    cik10 = _ticker_to_cik10(ticker)
+    subs = _get_json(f"https://data.sec.gov/submissions/CIK{cik10}.json")
+
+    recent = subs.get("filings", {}).get("recent", {})
+    forms = recent.get("form", [])
+    dates = recent.get("filingDate", [])
+    accessions = recent.get("accessionNumber", [])
+    primary_docs = recent.get("primaryDocument", [])
+
+    urls: List[str] = []
+    for form, d, acc, doc in zip(forms, dates, accessions, primary_docs):
+        if form.upper() != "424B5":
+            continue
+        filing_date = datetime.strptime(d, "%Y-%m-%d").date()
+        if start <= filing_date <= end:
+            urls.append(_primary_doc_url(cik10, acc, doc))
+
+    return urls
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import requests
+
+EVENTS = "https://gamma-api.polymarket.com/events"
+
+ticker_to_urls = {}
+
+limit, offset = 500, 0
+while True:
+    r = requests.get(EVENTS, params={"limit": limit, "offset": offset}, timeout=30)
+    r.raise_for_status()
+    evs = r.json()
+    if not evs:
+        break
+
+    for ev in evs:
+        slug = ev.get("slug", "") or ""
+        if "quarterly-earnings" not in slug:
+            continue
+
+        # ticker is prefix before "-quarterly-earnings"
+        ticker = slug.split("-quarterly-earnings", 1)[0].upper()
+        url = f"https://polymarket.com/event/{slug}"
+        ticker_to_urls.setdefault(ticker, []).append(url)
+
+    offset += limit
+
+print(f"Tickers found: {len(ticker_to_urls)}")
+display(ticker_to_urls)
+
+
+
+
+
+import re, json, requests, pandas as pd
+
+GAMMA_MARKET_BY_SLUG = "https://gamma-api.polymarket.com/markets/slug/{}"
+GAMMA_EVENT_BY_SLUG  = "https://gamma-api.polymarket.com/events/slug/{}"
+CLOB_PRICE_HISTORY   = "https://clob.polymarket.com/prices-history"
+
+def _as_list(x):
+    if isinstance(x, list): return x
+    if isinstance(x, str) and x.strip().startswith("["): return json.loads(x)
+    return []
+
+def get_polymarket_hist(event_url: str) -> pd.DataFrame:
+    slug = re.search(r"polymarket\.com/(?:event|market)/([^/?#]+)", event_url).group(1)
+
+    # 1) Try as market slug
+    r = requests.get(GAMMA_MARKET_BY_SLUG.format(slug), timeout=30)
+    market = r.json() if r.ok else None
+
+    # 2) If not a market slug, treat as event slug and grab its first market
+    if not market or "clobTokenIds" not in market:
+        ev = requests.get(GAMMA_EVENT_BY_SLUG.format(slug), timeout=30).json()
+        market = (ev.get("markets") or [None])[0]
+        if not market:
+            raise RuntimeError("No markets found under this event slug.")
+
+    outcomes  = _as_list(market.get("outcomes"))
+    token_ids = _as_list(market.get("clobTokenIds"))
+    idx = outcomes.index("Yes") if "Yes" in outcomes else 0
+    token_id = str(token_ids[idx])
+
+    history = []
+    for fidelity in (5, 60, 60 * 12, 60 * 24):  # 5m -> 1h -> 12h -> 1d
+        resp = requests.get(
+            CLOB_PRICE_HISTORY, 
+            params={"market": token_id, "interval": "max", "fidelity": fidelity}, 
+            timeout=30
+        )
+        resp.raise_for_status()
+        history = resp.json().get("history", [])
+        if history:
+            break
+
+    df = pd.DataFrame(history).rename(columns={"t":"data_time","p":"prob"})
+    df["data_time"] = pd.to_datetime(
+        df["data_time"], unit="s", utc=True
+    ).dt.tz_convert("America/New_York").dt.tz_localize(None)
+    df["prob"] = df["prob"].astype(float)
+    return df
+
+
+
+
+
+from tqdm import tqdm
+
+data_polymarket_hist = pd.DataFrame()
+for ticker in tqdm(ticker_to_urls):
+    for url in ticker_to_urls[ticker]:
+        df = get_polymarket_hist(url)
+        df['ticker'] = ticker
+        df['url'] = url
+        if not df.empty:
+            data_polymarket_hist = pd.concat([data_polymarket_hist, df])
+    break
+data_polymarket_hist
+
+
+
+data_polymarket_hist.groupby('url').plot(x='data_time', y='prob', kind='line')
